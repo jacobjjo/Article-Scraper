@@ -3,29 +3,10 @@ import os
 import pandas as pd
 from tqdm import tqdm
 import re
-from os import path
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import sys
-
-excel = './RECORDS 1-1000.xlsx'
-
-if len(sys.argv) < 2:
-    print("Usage:")
-    print("python script.py <excel_file>")
-    sys.exit(1)
-
-excel = sys.argv[1]
-
-output_excel = sys.argv[2] if len(sys.argv) > 2 else "output.xlsx"
-print(output_excel)
-
-if not os.path.exists(excel):
-    print(f"ERROR: File not found: {excel}")
-    sys.exit(1)
-
-print(f"Using Excel file: {excel}")
 
 # Iterate through all dois in spreadsheet
 # Download from unpaywall api
@@ -67,7 +48,6 @@ def extract_pdf_link(content: bytes):
 def detect_columns(df):
 
     detected = {}
-    print(df.columns)
     for col in df.columns:
 
         clean = str(col).strip().lower()
@@ -80,131 +60,155 @@ def detect_columns(df):
 
     return detected
 
-try:
-    columns = detect_columns(pd.read_excel(excel, header=10))
-    df = pd.read_excel(
-        excel,
-        usecols=lambda c: str(c).strip().lower() in [
-        "doi",
-        "title"],
-        header=10
-    )
-except pd.errors.ParserError as e:
-    print(f"ERROR: Failed to parse Excel file: {e}")
-    sys.exit(1)
+def process_file(excel, progress_callback, output_excel="output.xlsx", filter_year=None, stop_event=None):
 
-articles = {}
-
-for index, row in df.iterrows():
-
-    doi = str(row['DOI']).strip()
-
-    if doi == "nan":
-        continue
-
-    articles[doi] = {
-            'doi': doi,
-            'title': row['Title'],
-            'url': "",
-            'downloaded': False,
-            'path': "",
-            'row': index
-    }
-
-EMAIL = "jacobjeremiah42@gmail.com"
-
-output_dir = "pdfs"
-
-os.makedirs(output_dir, exist_ok=True)
-
-print(f"Total DOIs to process: {len(articles)}")
-
-# ---------------- MULTITHREADED DOWNLOAD FUNCTION ----------------
-
-def download_pdf(article):
+    progress_callback(0, "Reading Excel...")
 
     try:
+        df = pd.read_excel(
+            excel,
+            usecols=lambda c: str(c).strip().lower() in [
+            "doi",
+            "title",
+            "publication year"],
+            header=10
+        )
+    except pd.errors.ParserError as e:
+        print(f"ERROR: Failed to parse Excel file: {e}")
+        sys.exit(1)
 
-        url = f"https://api.unpaywall.org/v2/{article['doi']}?email={EMAIL}"
+    progress_callback(10, "Processing DOIs...")
 
-        r = session.get(url, timeout=15).json()
+    articles = {}
 
-        pdf_url = None
+    total = len(df)
 
-        if r.get("best_oa_location"):
+    for index, row in df.iterrows():
+        print(total, index)
 
-            pdf_url = r["best_oa_location"].get("url_for_pdf")
+        doi = str(row['DOI']).strip()
+        year = str(row['Publication Year']).strip()
 
-            article["url"] = r["best_oa_location"].get("url")
+        if doi == "nan":
+            continue
+        
+        if filter_year and year not in filter_year:
+            continue
 
-        if pdf_url:
+        if stop_event.is_set():
+            return
 
-            pdf_response = session.get(pdf_url, timeout=20)
+        articles[doi] = {
+                'doi': doi,
+                'title': row['Title'],
+                'url': "",
+                'downloaded': False,
+                'path': "",
+                'row': index
+        }
 
-            content = pdf_response.content
+    EMAIL = "jacobjeremiah42@gmail.com"
 
-            if verify_pdf_bytes(content):
+    output_dir = "pdfs"
 
-                filename = renamer(article['title'], article['doi'])
+    os.makedirs(output_dir, exist_ok=True)
 
-                file_path = os.path.join(output_dir, filename)
+    # ---------------- MULTITHREADED DOWNLOAD FUNCTION ----------------
 
-                with open(file_path, "wb") as f:
-                    f.write(content)
+    def download_pdf(article):
 
-                article["downloaded"] = True
-                article["path"] = file_path
+        try:
 
-                return True
+            url = f"https://api.unpaywall.org/v2/{article['doi']}?email={EMAIL}"
 
-    except Exception as e:
-        print(f"ERROR {article['doi']}: {e}")
+            r = session.get(url, timeout=15).json()
 
-    return False
+            pdf_url = None
 
-# ---------------- MULTITHREADED EXECUTION ----------------
+            if r.get("best_oa_location"):
 
-print("First pass of downloading PDFs from Unpaywall API")
+                pdf_url = r["best_oa_location"].get("url_for_pdf")
 
-futures = []
+                article["url"] = r["best_oa_location"].get("url")
 
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            if pdf_url:
 
-    for _, article in articles.items():
+                pdf_response = session.get(pdf_url, timeout=20)
 
-        futures.append(
-            executor.submit(download_pdf, article)
+                content = pdf_response.content
+
+                if verify_pdf_bytes(content):
+
+                    filename = renamer(article['title'], article['doi'])
+
+                    file_path = os.path.join(output_dir, filename)
+
+                    with open(file_path, "wb") as f:
+                        f.write(content)
+
+                    article["downloaded"] = True
+                    article["path"] = file_path
+
+                    return True
+
+        except Exception as e:
+            print(f"ERROR {article['doi']}: {e}")
+
+        return False
+
+    # ---------------- MULTITHREADED EXECUTION ----------------
+
+    futures = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+
+        for _, article in articles.items():
+
+            futures.append(
+                executor.submit(download_pdf, article)
+            )
+
+        total = len(futures)
+        for completed, future in enumerate(as_completed(futures), 1):
+            
+            if stop_event.is_set():
+                executor.shutdown(
+                    wait=False,
+                    cancel_futures=True
+                )
+                return
+    
+            future.result()
+
+            percent = 10 + int((completed / total) * 80)
+
+            progress_callback(
+                percent,
+                f"Downloaded {completed} of {total} PDFs"
+            )
+
+    # ---------------- UPDATE EXCEL ----------------
+
+    total_articles = len(articles.values())
+    index = 0
+    for article in articles.values():
+
+        if article["downloaded"] == True:
+            df.at[article['row'], 'PDF Downloaded? (Y/N)'] = "Y"
+        else:
+            df.at[article['row'], 'PDF Downloaded? (Y/N)'] = "N"
+
+        percent = 90 + int((index / total_articles) * 10)
+
+        progress_callback(
+            percent,
+            f"Updating spreadsheet ({index+1}/{total_articles})"
         )
 
-    for future in tqdm(
-        as_completed(futures),
-        total=len(futures),
-        desc="Downloading PDFs"
-    ):
-        future.result()
+        index += 1
 
-# ---------------- COUNT REMAINING ----------------
-
-remaining = [
-    a for a in articles.values()
-    if not a["downloaded"]
-]
-
-print(f"First pass complete. {len(remaining)} DOIs remain without valid PDFs.")
-
-# ---------------- UPDATE EXCEL ----------------
-
-for _, article in tqdm(articles.items(), desc="Editing Excel"):
-
-    if article["downloaded"] == True:
-        df.at[article['row'], 'PDF Downloaded? (Y/N)'] = "Y"
-    else:
-        df.at[article['row'], 'PDF Downloaded? (Y/N)'] = "N"
-
-df.to_excel(
-    output_excel,
-    index=False,
-    sheet_name="savedrecs"
-)
-
-print("Done.")
+    df.to_excel(
+        output_excel,
+        index=False,
+        sheet_name="savedrecs"
+    )
